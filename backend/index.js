@@ -9,17 +9,15 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Initialize the Google Gen AI SDK using your .env key
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const VAULT_FILE = 'vector_vault.json';
 
 app.use(cors());
 app.use(express.json());
 
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    if (!fs.existsSync('uploads/')) {
-      fs.mkdirSync('uploads/');
-    }
+    if (!fs.existsSync('uploads/')) fs.mkdirSync('uploads/');
     cb(null, 'uploads/');
   },
   filename: (req, file, cb) => {
@@ -50,12 +48,26 @@ const extractTextFromPdf = (filePath) => {
   });
 };
 
+// Helper to read/write to our local database file
+function saveToVault(newRecords) {
+  let currentVault = [];
+  if (fs.existsSync(VAULT_FILE)) {
+    try {
+      currentVault = JSON.parse(fs.readFileSync(VAULT_FILE, 'utf-8'));
+    } catch (e) {
+      currentVault = [];
+    }
+  }
+  const updatedVault = [...currentVault, ...newRecords];
+  fs.writeFileSync(VAULT_FILE, JSON.stringify(updatedVault, null, 2));
+}
+
 app.get('/api/health', (req, res) => {
   res.json({ status: "Server is running perfectly!" });
 });
 
 /**
- * CORE PIPELINE TASK: Upload, Parse, Chunk, and EMBED
+ * CORE PIPELINE TASK: Upload, Parse, Chunk, Embed, and SAVE to Database
  */
 app.post('/api/upload', upload.single('file'), async (req, res) => {
   try {
@@ -63,43 +75,55 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
       return res.status(400).json({ error: "No file uploaded." });
     }
 
-    console.log(`\n--- Starting Pipeline for: ${req.file.originalname} ---`);
+    console.log(`\n--- Ingestion Pipeline Active: ${req.file.originalname} ---`);
 
-    // 1 & 2. Extract Text
     const rawText = await extractTextFromPdf(req.file.path);
     if (!rawText || rawText.trim().length === 0) {
       throw new Error("Could not extract any readable text from this PDF.");
     }
 
-    // 3. Chunk Text
     const textChunks = chunkText(rawText, 1000, 200);
-    console.log(`[Success] Generated ${textChunks.length} text chunks.`);
+    console.log(`[1/3] Sliced text into ${textChunks.length} chunks.`);
 
-    // 4. Generate Embeddings via Gemini API
-    console.log("Sending chunks to Gemini Embedding Engine...");
-    
-    const sampleChunk = textChunks[0];
-    
-    // We use 'gemini-embedding-2' which is optimized for the new GenAI SDK
-    const embeddingResponse = await ai.models.embedContent({
-      model: 'gemini-embedding-2',
-      contents: sampleChunk,
-    });
+    console.log("[2/3] Generating embeddings via Gemini API...");
+    const databaseRecords = [];
 
-    // Extract values safely from the array response structure
-    const vector = embeddingResponse.embeddings[0].values;
-    console.log(`[Success] Received embedding vector for Chunk #1!`);
-    console.log(`Vector Dimensions: ${vector.length} numbers (e.g., [${vector.slice(0, 3)}...])`);
+    // Loop through ALL chunks and generate a vector for each one
+    // We add a tiny delay to respect free-tier rate limits gracefully
+    for (let i = 0; i < textChunks.length; i++) {
+      const chunkTextData = textChunks[i];
+      
+      const embeddingResponse = await ai.models.embedContent({
+        model: 'gemini-embedding-2',
+        contents: chunkTextData,
+      });
+
+      const vector = embeddingResponse.embeddings[0].values;
+
+      // Pack the text, the vector numbers, and the metadata together
+      databaseRecords.push({
+        id: `${Date.now()}-${i}`,
+        filename: req.file.originalname,
+        chunkIndex: i,
+        text: chunkTextData,
+        embedding: vector
+      });
+
+      // Simple artificial delay to avoid hammering the free tier api limits too quickly
+      await new Promise(resolve => setTimeout(resolve, 200));
+    }
+
+    console.log(`[3/3] Committing ${databaseRecords.length} records to local vector vault...`);
+    saveToVault(databaseRecords);
 
     res.json({
-      message: "File processed and vector embeddings calculated successfully!",
+      message: "File completely ingested and committed to vector database storage!",
       filename: req.file.originalname,
       totalChunks: textChunks.length,
-      vectorDimensions: vector.length,
-      sampleVectorPreview: vector.slice(0, 5),
+      savedStatus: true,
       chunksPreview: textChunks.slice(0, 2)
     });
-    
+
   } catch (error) {
     console.error("Pipeline Error:", error);
     res.status(500).json({ error: `Failed to process document: ${error.message}` });
